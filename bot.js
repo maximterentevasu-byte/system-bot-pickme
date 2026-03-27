@@ -1,177 +1,205 @@
+require('dotenv').config();
+
 const { Telegraf, Markup } = require('telegraf');
-const XLSX = require('xlsx');
-const path = require('path');
+const OpenAI = require('openai');
+const axios = require('axios');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-const ADMIN_ID = 758972533;
-const ADMIN_USERNAME = 'tervmax';
+// Хранилище фото по chatId
+const userSessions = new Map();
 
-const EXCEL_FILE_PATH = path.join(__dirname, 'CLIENT_EXPORT.xlsx');
-const REGISTRATION_URL = 'https://card.evobonus.ru/form/74e48448-1975-4bca-a455-92ec9a4bbf76';
-const ANDROID_URL = 'https://play.google.com/store/apps/details?id=com.sst.evobonus&referrer=pass_url%3Dhttps://appcampaign.a1-systems.com/passkit/v1/passes/pass.com.ng.naviguide/fe694199-ef3e-47a4-83d1-7e622908398b%26org%3DSomeOrg';
-
-// Нормализация телефона
-function normalizePhone(phone) {
-    if (!phone) return '';
-    let cleaned = String(phone).replace(/\D/g, '');
-    if (cleaned.length === 11 && cleaned.startsWith('8')) {
-        cleaned = '7' + cleaned.slice(1);
-    }
-    return cleaned;
+function getMainKeyboard() {
+  return Markup.keyboard([['Готово'], ['Очистить']]).resize();
 }
 
-// Поиск карты
-function findCardLinkByPhone(phone) {
-    const normalizedPhone = normalizePhone(phone);
+function getStartKeyboard() {
+  return Markup.keyboard([['Начать заново']]).resize();
+}
 
-    const workbook = XLSX.readFile(EXCEL_FILE_PATH);
-    const sheet = workbook.Sheets[workbook.SheetNames[0]];
-
-    const rows = XLSX.utils.sheet_to_json(sheet, {
-        header: 1,
-        defval: ''
+function ensureSession(chatId) {
+  if (!userSessions.has(chatId)) {
+    userSessions.set(chatId, {
+      photos: [],
+      processing: false,
     });
+  }
+  return userSessions.get(chatId);
+}
 
-    for (let i = 0; i < rows.length; i++) {
-        const excelPhone = normalizePhone(rows[i][4]);
-        const cardLink = String(rows[i][15] || '').trim();
+function resetSession(chatId) {
+  userSessions.set(chatId, {
+    photos: [],
+    processing: false,
+  });
+}
 
-        if (excelPhone && excelPhone === normalizedPhone) {
-            return cardLink;
-        }
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+async function telegramFileToDataUrl(fileId) {
+  const fileLink = await bot.telegram.getFileLink(fileId);
+  const response = await axios.get(fileLink.href, {
+    responseType: 'arraybuffer',
+    timeout: 30000,
+  });
+
+  const contentType = response.headers['content-type'] || 'image/jpeg';
+  const base64 = Buffer.from(response.data).toString('base64');
+  return `data:${contentType};base64,${base64}`;
+}
+
+async function analyzeProductImages(imageDataUrls) {
+  const inputContent = [
+    {
+      type: 'input_text',
+      text:
+        'Ты помощник по карточкам товара для магазина. ' +
+        'На входе фотографии упаковки товара. ' +
+        'Текст на упаковке может быть на китайском, английском или корейском. ' +
+        'Твоя задача: внимательно прочитать текст на всех изображениях, перевести важные данные на русский язык ' +
+        'и собрать результат строго в 5 абзацев.\n\n' +
+        'Верни ответ строго в таком формате:\n' +
+        '1. Название товара: ...\n' +
+        '2. Описание товара: ...\n' +
+        '3. Состав, КБЖУ, срок хранения: ...\n' +
+        '4. Производитель: ...\n' +
+        '5. Штрих код товара: ...\n\n' +
+        'Требования:\n' +
+        '- Не выдумывай данные, которых нет на фото.\n' +
+        '- Если какого-то поля нет, так и напиши: "не указано".\n' +
+        '- В абзаце "Описание товара" напиши кратко и продающе, 1–3 предложения.\n' +
+        '- Если на нескольких фото данные частично отличаются, используй наиболее полный и логичный вариант.\n' +
+        '- Ответ только на русском языке.'
     }
+  ];
 
-    return null;
-}
-
-// Имя пользователя
-function getUserDisplayName(user) {
-    if (user.username) return `@${user.username}`;
-    return [user.first_name, user.last_name].filter(Boolean).join(' ') || 'без имени';
-}
-
-// Главное меню (4 кнопки)
-function mainMenu(ctx) {
-    return ctx.reply(
-        'Привет! Я бот бонусной программы Pick me. Выбери интересующий тебя пункт:',
-        Markup.keyboard([
-            ['Подключиться к бонусной программе'],
-            ['Скачать бонусную карту на телефон'],
-            ['Скачать Эвобонус для Android'],
-            ['Сообщить об ошибке']
-        ]).resize()
-    );
-}
-
-// Регистрация
-function sendRegistration(ctx) {
-    return ctx.reply(
-        `Для регистрации в бонусной программе заполни <a href="${REGISTRATION_URL}">анкету</a>`,
-        {
-            parse_mode: 'HTML',
-            ...Markup.keyboard([['На главный экран']]).resize()
-        }
-    );
-}
-
-// START
-bot.start((ctx) => mainMenu(ctx));
-
-// Кнопка 1
-bot.hears('Подключиться к бонусной программе', (ctx) => sendRegistration(ctx));
-
-// Кнопка 2
-bot.hears('Скачать бонусную карту на телефон', (ctx) => {
-    return ctx.reply(
-        'Нажми кнопку ниже, чтобы отправить свой контакт:',
-        Markup.keyboard([
-            [Markup.button.contactRequest('Отправить контакт')],
-            ['На главный экран']
-        ]).resize()
-    );
-});
-
-// Кнопка Android
-bot.hears('Скачать Эвобонус для Android', (ctx) => {
-    return ctx.reply(
-        'Для скачивания нажмите на кнопку:',
-        Markup.inlineKeyboard([
-            [Markup.button.url('Скачать приложение', ANDROID_URL)]
-        ])
-    ).then(() => {
-        return ctx.reply(
-            ' ',
-            Markup.keyboard([['На главный экран']]).resize()
-        );
+  for (const imageUrl of imageDataUrls) {
+    inputContent.push({
+      type: 'input_image',
+      image_url: imageUrl,
     });
+  }
+
+  const response = await openai.responses.create({
+    model: 'gpt-5.2',
+    input: [
+      {
+        role: 'user',
+        content: inputContent,
+      },
+    ],
+  });
+
+  return response.output_text?.trim() || 'Не удалось получить ответ от модели.';
+}
+
+bot.start(async (ctx) => {
+  resetSession(ctx.chat.id);
+  await ctx.reply(
+    'Подгрузи фотографии товара',
+    getMainKeyboard()
+  );
 });
 
-// Кнопка "Сообщить об ошибке"
-bot.hears('Сообщить об ошибке', (ctx) => {
-    return ctx.reply(
-        'Напишите администратору:',
-        Markup.inlineKeyboard([
-            [Markup.button.url('Открыть чат с администратором', `https://t.me/${ADMIN_USERNAME}`)]
-        ])
-    );
+bot.hears('Начать заново', async (ctx) => {
+  resetSession(ctx.chat.id);
+  await ctx.reply(
+    'Подгрузи фотографии товара',
+    getMainKeyboard()
+  );
 });
 
-// Обработка контакта
-bot.on('contact', async (ctx) => {
-    try {
-        const contact = ctx.message.contact;
-        const phone = contact?.phone_number;
-        const userName = getUserDisplayName(ctx.from);
+bot.hears('Очистить', async (ctx) => {
+  resetSession(ctx.chat.id);
+  await ctx.reply(
+    'Все загруженные фото удалены. Подгрузи фотографии товара заново.',
+    getMainKeyboard()
+  );
+});
 
-        if (!phone) {
-            await bot.telegram.sendMessage(
-                ADMIN_ID,
-                `Пользователь ${userName} не смог скачать электронную карту.`
-            );
+bot.on('photo', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const session = ensureSession(chatId);
 
-            return ctx.reply(
-                'Невозможно идентифицировать карту по номеру телефона, мы отправили запрос администратору.',
-                Markup.keyboard([['На главный экран']]).resize()
-            );
-        }
+  if (session.processing) {
+    await ctx.reply('Подожди, я уже обрабатываю предыдущую пачку фотографий.');
+    return;
+  }
 
-        const cardLink = findCardLinkByPhone(phone);
+  const photos = ctx.message.photo;
+  const bestPhoto = photos[photos.length - 1]; // самое крупное фото
+  session.photos.push(bestPhoto.file_id);
 
-        if (cardLink) {
-            return ctx.reply(
-                'Твоя бонусная карта готова 🎉\nНажми кнопку ниже:',
-                Markup.inlineKeyboard([
-                    [Markup.button.url('Скачать карту', cardLink)]
-                ])
-            );
-        } else {
-            return ctx.reply(
-                'Карта с указанным номером телефона не существует. Выпустить новую карту?',
-                Markup.keyboard([
-                    ['Подключиться к бонусной программе'],
-                    ['На главный экран']
-                ]).resize()
-            );
-        }
+  await ctx.reply(
+    `Фото загружено. Сейчас в наборе: ${session.photos.length}.\n` +
+    'Можешь отправить еще фото или нажать "Готово".',
+    getMainKeyboard()
+  );
+});
 
-    } catch (e) {
-        console.error(e);
+bot.hears('Готово', async (ctx) => {
+  const chatId = ctx.chat.id;
+  const session = ensureSession(chatId);
 
-        await bot.telegram.sendMessage(
-            ADMIN_ID,
-            `Ошибка у пользователя ${getUserDisplayName(ctx.from)}`
-        );
+  if (session.processing) {
+    await ctx.reply('Подожди, я уже обрабатываю фото.');
+    return;
+  }
 
-        return ctx.reply(
-            'Произошла ошибка. Мы уже сообщили администратору.',
-            Markup.keyboard([['На главный экран']]).resize()
-        );
+  if (!session.photos.length) {
+    await ctx.reply('Сначала подгрузи хотя бы одну фотографию товара.');
+    return;
+  }
+
+  session.processing = true;
+
+  try {
+    await ctx.reply('Обрабатываю фотографии, это может занять до минуты…');
+
+    const imageDataUrls = [];
+    for (const fileId of session.photos) {
+      const dataUrl = await telegramFileToDataUrl(fileId);
+      imageDataUrls.push(dataUrl);
     }
+
+    const result = await analyzeProductImages(imageDataUrls);
+
+    await ctx.reply(
+      escapeHtml(result),
+      {
+        parse_mode: 'HTML',
+        ...getStartKeyboard(),
+      }
+    );
+
+    resetSession(chatId);
+  } catch (error) {
+    console.error('Ошибка обработки фото:', error);
+    session.processing = false;
+
+    await ctx.reply(
+      'Не получилось обработать фотографии. Попробуй еще раз.',
+      getMainKeyboard()
+    );
+  }
 });
 
-// Назад
-bot.hears('На главный экран', (ctx) => mainMenu(ctx));
+bot.on('message', async (ctx) => {
+  if (ctx.message.photo) return;
+
+  await ctx.reply(
+    'Подгрузи фотографии товара. Когда закончишь, нажми "Готово".',
+    getMainKeyboard()
+  );
+});
 
 bot.launch();
 console.log('Bot started...');
