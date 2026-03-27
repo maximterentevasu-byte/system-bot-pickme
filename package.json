@@ -1,5 +1,5 @@
 {
-  "name": "telegram-bot",
+  "name": "product-photo-bot",
   "version": "1.0.0",
   "main": "bot.js",
   "scripts": {
@@ -9,7 +9,6 @@
     "axios": "^1.14.0",
     "dotenv": "^17.3.1",
     "openai": "^6.33.0",
-    "telegraf": "^4.16.3",
-    "xlsx": "^0.18.5"
+    "telegraf": "^4.16.3"
   }
 }
