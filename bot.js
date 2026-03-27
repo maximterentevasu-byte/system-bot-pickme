@@ -326,7 +326,10 @@ bot.hears('Открыть таблицу', async (ctx) => {
 
 bot.hears('Очистить', async (ctx) => {
   resetSession(ctx.chat.id);
-  await ctx.reply('Все загруженные фото очищены. Подгрузи фотографии товара заново.', keyboard());
+  await ctx.reply(
+    'Все загруженные фото очищены. Подгрузи фотографии товара заново.',
+    keyboard()
+  );
 });
 
 bot.on('photo', async (ctx) => {
@@ -439,13 +442,28 @@ bot.hears('Готово', async (ctx) => {
     const existingBarcodes = await getAllBarcodes();
     if (existingBarcodes.includes(result.barcode)) {
       resetSession(ctx.chat.id);
-      await ctx.reply('⚠️ Товар с таким штрихкодом уже есть в таблице. Повторно добавлять его не нужно.', tableButton());
+      await ctx.reply(
+        '⚠️ Товар с таким штрихкодом уже есть в таблице. Повторно добавлять его не нужно.',
+        tableButton()
+      );
       return;
     }
 
-    const firstPhoto = imageMetaList[0];
-    const safeFileName = `${result.barcode}_${Date.now()}.${firstPhoto.extension}`;
-    const photoUrl = await uploadPhotoToDrive(firstPhoto.buffer, firstPhoto.mimeType, safeFileName);
+    let photoUrl = '';
+
+    try {
+      const firstPhoto = imageMetaList[0];
+      const safeFileName = `${result.barcode}_${Date.now()}.${firstPhoto.extension}`;
+      photoUrl = await uploadPhotoToDrive(
+        firstPhoto.buffer,
+        firstPhoto.mimeType,
+        safeFileName
+      );
+    } catch (driveError) {
+      console.error('=== DRIVE UPLOAD ERROR START ===');
+      console.error(driveError);
+      console.error('=== DRIVE UPLOAD ERROR END ===');
+    }
 
     await writeToGoogleSheets(result, photoUrl);
 
@@ -457,7 +475,10 @@ bot.hears('Готово', async (ctx) => {
     console.error('=== BOT ERROR END ===');
 
     session.processing = false;
-    await ctx.reply('Ошибка обработки. Попробуй ещё раз или нажми "Очистить".', keyboard());
+    await ctx.reply(
+      'Ошибка обработки. Попробуй ещё раз или нажми "Очистить".',
+      keyboard()
+    );
   }
 });
 
