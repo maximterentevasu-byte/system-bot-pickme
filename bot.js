@@ -16,7 +16,7 @@ const sessions = new Map();
 const cache = new Map();
 
 const MAX_PHOTOS = 3;
-const FILE_PATH = './Новый файл для русификации.xlsx';
+const FILE_PATH = './Новый файл руссификации.xlsx';
 
 function keyboard() {
   return Markup.keyboard([['Готово'], ['Очистить']]).resize();
