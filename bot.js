@@ -123,7 +123,7 @@ async function analyze(images) {
 async function writeToGoogleSheets(data) {
   await sheets.spreadsheets.values.append({
     spreadsheetId: SPREADSHEET_ID,
-    range: 'Sheet1',
+    range: 'Sheet1!A1',
     valueInputOption: 'USER_ENTERED',
     requestBody: {
       values: [[
@@ -214,9 +214,12 @@ bot.hears('Готово', async (ctx) => {
     resetSession(ctx.chat.id);
 
   } catch (e) {
-    console.error(e);
-    ctx.reply('Ошибка обработки');
-  }
+  console.error('=== GOOGLE ERROR ===');
+  console.error(e.response?.data || e.message || e);
+  console.error('====================');
+
+  ctx.reply('Ошибка записи в таблицу');
+}
 });
 
 bot.launch();
