@@ -23,14 +23,20 @@ const sheets = google.sheets({ version: 'v4', auth });
 
 const SPREADSHEET_ID = '1MfHUleOrA6aV95tnBKyBywe3bSO9PmdCvX8OaMvGz1A';
 
+const TABLE_URL =
+  'https://docs.google.com/spreadsheets/d/1MfHUleOrA6aV95tnBKyBywe3bSO9PmdCvX8OaMvGz1A/edit';
+
 // ===== SESSION =====
 
 const sessions = new Map();
 const cache = new Map();
-const MAX_PHOTOS = 3;
 
 function keyboard() {
-  return Markup.keyboard([['Готово'], ['Очистить']]).resize();
+  return Markup.keyboard([
+    ['Готово'],
+    ['Очистить'],
+    ['Открыть таблицу'],
+  ]).resize();
 }
 
 function getSession(chatId) {
@@ -60,43 +66,30 @@ async function telegramFileToDataUrl(fileId) {
 // ===== JSON FIX =====
 
 function cleanJsonText(text) {
-  if (!text) return '';
-  let cleaned = String(text).trim();
-  cleaned = cleaned.replace(/^```json\s*/i, '');
-  cleaned = cleaned.replace(/^```\s*/i, '');
-  cleaned = cleaned.replace(/\s*```$/i, '');
+  let cleaned = text.trim();
+  cleaned = cleaned.replace(/^```json/, '').replace(/```$/, '');
   return cleaned.trim();
 }
 
-function parseModelJson(rawText) {
-  const cleaned = cleanJsonText(rawText);
-
-  try {
-    return JSON.parse(cleaned);
-  } catch {
-    const start = cleaned.indexOf('{');
-    const end = cleaned.lastIndexOf('}');
-    return JSON.parse(cleaned.slice(start, end + 1));
-  }
+function parseModelJson(text) {
+  const cleaned = cleanJsonText(text);
+  return JSON.parse(cleaned);
 }
 
-// ===== OPENAI (УЛУЧШЕННЫЙ ПРОМТ) =====
+// ===== OPENAI =====
 
 async function analyze(images) {
   const content = [
     {
       type: 'input_text',
       text: `
-Ты эксперт по созданию карточек товаров для маркетплейсов (Wildberries, Ozon).
+СТРОГО:
 
-СТРОГИЕ ПРАВИЛА:
-- ВСЁ ПИШИ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ
-- ОБЯЗАТЕЛЬНО ПЕРЕВОДИ с китайского, английского, корейского
-- НЕЛЬЗЯ оставлять английские слова
-- НЕЛЬЗЯ копировать оригинал
-- Если не перевел — это ошибка
+- ВСЕ на русском
+- ШТРИХКОД ОБЯЗАТЕЛЕН
+- если штрихкод не читается → "barcode": "не найден"
 
-Сформируй JSON:
+JSON:
 
 {
   "name": "",
@@ -105,43 +98,7 @@ async function analyze(images) {
   "manufacturer": "",
   "barcode": ""
 }
-
-ТРЕБОВАНИЯ:
-
-1. name:
-- Короткое, понятное название
-- Переведённое
-- Без мусора типа WOW!, SUPER и т.д.
-
-2. description:
-- Как для маркетплейса
-- 2–3 предложения
-- Продающее
-- Простым понятным языком
-- Подчеркни вкус, пользу, удобство
-
-3. details:
-- Состав
-- КБЖУ
-- Срок хранения
-- Всё на русском
-
-4. manufacturer:
-- Перевести на русский
-- Если китайский — сделать читаемо:
-  Пример:
-  "Chaozhou Chaoan Hongtaiji Food Co. Ltd"
-  →
-  "Компания Hongtaiji Food, город Чаочжоу, Китай"
-
-5. barcode:
-- Только цифры
-- Без изменений
-
-Если данных нет — "не указано"
-
-Ответ только JSON
-      `.trim(),
+      `,
     },
   ];
 
@@ -161,7 +118,16 @@ async function analyze(images) {
   return response.output_text;
 }
 
-// ===== GOOGLE WRITE =====
+// ===== GOOGLE =====
+
+async function getAllBarcodes() {
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: 'Sheet1!E:E',
+  });
+
+  return (res.data.values || []).flat();
+}
 
 async function writeToGoogleSheets(data) {
   await sheets.spreadsheets.values.append({
@@ -187,17 +153,19 @@ bot.start((ctx) => {
   ctx.reply('Подгрузи фотографии товара', keyboard());
 });
 
+bot.hears('Открыть таблицу', (ctx) => {
+  ctx.reply('Открыть таблицу:', Markup.inlineKeyboard([
+    Markup.button.url('Перейти', TABLE_URL)
+  ]));
+});
+
 bot.on('photo', (ctx) => {
   const session = getSession(ctx.chat.id);
-
-  if (session.photos.length >= MAX_PHOTOS) {
-    return ctx.reply('Максимум 3 фото');
-  }
 
   const photo = ctx.message.photo.pop();
   session.photos.push(photo.file_id);
 
-  ctx.reply(`Добавлено ${session.photos.length}/3`);
+  ctx.reply(`Фото добавлено (${session.photos.length})`);
 });
 
 bot.hears('Очистить', (ctx) => {
@@ -212,8 +180,6 @@ bot.hears('Готово', async (ctx) => {
     return ctx.reply('Нет фото');
   }
 
-  session.processing = true;
-
   try {
     ctx.reply('Обрабатываю...');
 
@@ -222,38 +188,31 @@ bot.hears('Готово', async (ctx) => {
       images.push(await telegramFileToDataUrl(id));
     }
 
-    const hash = crypto
-      .createHash('md5')
-      .update(images.join(''))
-      .digest('hex');
+    const raw = await analyze(images);
+    const result = parseModelJson(raw);
 
-    let result;
+    // ===== ШТРИХКОД =====
 
-    if (cache.has(hash)) {
-      result = cache.get(hash);
-    } else {
-      const raw = await analyze(images);
-      result = parseModelJson(raw);
-      cache.set(hash, result);
+    if (!result.barcode || result.barcode === 'не найден') {
+      return ctx.reply(
+        '❌ Не удалось распознать штрихкод. Сделай фото лучше (штрихкод должен быть чётким)'
+      );
     }
 
-    const fields = {
-      name: 'Название товара',
-      description: 'Описание товара',
-      details: 'Состав/КБЖУ/Срок',
-      manufacturer: 'Производитель',
-      barcode: 'Штрих код товара',
-    };
+    // ===== ДУБЛИ =====
 
-    for (const key in fields) {
-      if (!result[key] || result[key] === 'не указано') {
-        return ctx.reply(`Не хватает данных для заполнение столбца - ${fields[key]}`);
-      }
+    const existing = await getAllBarcodes();
+
+    if (existing.includes(result.barcode)) {
+      return ctx.reply('⚠️ Этот товар уже есть в базе');
     }
+
+    // ===== ЗАПИСЬ =====
 
     await writeToGoogleSheets(result);
 
-    ctx.reply('Товар записан в таблицу');
+    ctx.reply('✅ Товар записан в таблицу');
+
     resetSession(ctx.chat.id);
 
   } catch (e) {
