@@ -3,7 +3,6 @@ require('dotenv').config();
 const { Telegraf, Markup } = require('telegraf');
 const OpenAI = require('openai');
 const axios = require('axios');
-const sharp = require('sharp');
 const crypto = require('crypto');
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
@@ -17,195 +16,272 @@ const cache = new Map();
 
 const MAX_PHOTOS = 3;
 
-// ================= UI =================
-
-function keyboard() {
+function getMainKeyboard() {
   return Markup.keyboard([['Готово'], ['Очистить']]).resize();
 }
 
-function restartKeyboard() {
+function getRestartKeyboard() {
   return Markup.keyboard([['Начать заново']]).resize();
 }
 
-// ================= SESSION =================
-
-function getSession(chatId) {
+function ensureSession(chatId) {
   if (!sessions.has(chatId)) {
-    sessions.set(chatId, { photos: [], processing: false });
+    sessions.set(chatId, {
+      photos: [],
+      processing: false,
+    });
   }
   return sessions.get(chatId);
 }
 
 function resetSession(chatId) {
-  sessions.set(chatId, { photos: [], processing: false });
+  sessions.set(chatId, {
+    photos: [],
+    processing: false,
+  });
 }
 
-// ================= IMAGE =================
-
-// 🔥 Сжатие изображения
-async function compressImage(buffer) {
-  return await sharp(buffer)
-    .resize({ width: 800 }) // уменьшаем
-    .jpeg({ quality: 70 })  // сжатие
-    .toBuffer();
+function escapeHtml(text) {
+  return String(text)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
-// 🔥 Получение dataURL
-async function getImageDataUrl(fileId) {
-  const link = await bot.telegram.getFileLink(fileId);
+function guessMimeType(filePath = '', responseContentType = '') {
+  const lowerPath = String(filePath).toLowerCase();
+  const lowerContentType = String(responseContentType).toLowerCase();
 
-  const response = await axios.get(link.href, {
-    responseType: 'arraybuffer'
+  if (lowerContentType.startsWith('image/jpeg')) return 'image/jpeg';
+  if (lowerContentType.startsWith('image/jpg')) return 'image/jpeg';
+  if (lowerContentType.startsWith('image/png')) return 'image/png';
+  if (lowerContentType.startsWith('image/webp')) return 'image/webp';
+  if (lowerContentType.startsWith('image/gif')) return 'image/gif';
+
+  if (lowerPath.endsWith('.jpg') || lowerPath.endsWith('.jpeg')) return 'image/jpeg';
+  if (lowerPath.endsWith('.png')) return 'image/png';
+  if (lowerPath.endsWith('.webp')) return 'image/webp';
+  if (lowerPath.endsWith('.gif')) return 'image/gif';
+
+  return 'image/jpeg';
+}
+
+async function telegramFileToDataUrl(fileId) {
+  const fileInfo = await bot.telegram.getFile(fileId);
+  const fileLink = await bot.telegram.getFileLink(fileId);
+
+  const response = await axios.get(fileLink.href, {
+    responseType: 'arraybuffer',
+    timeout: 30000,
+    maxContentLength: 20 * 1024 * 1024,
+    maxBodyLength: 20 * 1024 * 1024,
   });
 
-  const compressed = await compressImage(response.data);
+  const mimeType = guessMimeType(
+    fileInfo?.file_path || '',
+    response.headers['content-type'] || ''
+  );
 
-  const base64 = Buffer.from(compressed).toString('base64');
-
-  return `data:image/jpeg;base64,${base64}`;
+  const base64 = Buffer.from(response.data).toString('base64');
+  return `data:${mimeType};base64,${base64}`;
 }
 
-// ================= HASH (для кеша) =================
-
-function generateHash(images) {
+function generateHash(imageDataUrls) {
   const hash = crypto.createHash('md5');
 
-  for (const img of images) {
-    hash.update(img);
+  for (const image of imageDataUrls) {
+    hash.update(image);
   }
 
   return hash.digest('hex');
 }
 
-// ================= OPENAI =================
-
-async function analyze(images) {
+async function analyzeProductImages(imageDataUrls) {
   const content = [
     {
       type: 'input_text',
       text: `
-Ты помощник по карточкам товара.
+Ты помощник по карточкам товара для магазина.
 
-Проанализируй изображения упаковки товара и выдай:
+Пользователь прислал фотографии упаковки товара.
+Текст на упаковке может быть на китайском, английском или корейском языке.
 
-Название товара:
-Описание товара:
-Состав, КБЖУ, срок хранения:
-Производитель:
-Штрих код товара:
+Твоя задача:
+1. Внимательно прочитать весь текст на всех изображениях.
+2. Перевести ключевую информацию на русский язык.
+3. Собрать итог строго в 5 абзацев.
+
+Верни ответ СТРОГО в таком формате:
+
+Название товара: ...
+Описание товара: ...
+Состав, КБЖУ, срок хранения: ...
+Производитель: ...
+Штрих код товара: ...
 
 Правила:
-- Не выдумывай
-- Если нет данных — пиши "не указано"
-- Описание 1–3 предложения
-- Ответ на русском
-      `
-    }
+- Ничего не выдумывай.
+- Если данных нет на фото, пиши: не указано.
+- "Описание товара" должно быть коротким, продающим, 1–3 предложения.
+- Если КБЖУ не видно, так и напиши.
+- Если штрихкод не читается, напиши: не указано.
+- Ответ только на русском языке.
+      `.trim(),
+    },
   ];
 
-  for (const img of images) {
+  for (const imageUrl of imageDataUrls) {
     content.push({
       type: 'input_image',
-      image_url: img,
-      detail: 'low' // 🔥 дешевле
+      image_url: imageUrl,
+      detail: 'low',
     });
   }
 
   const response = await openai.responses.create({
     model: 'gpt-4.1-mini',
     truncation: 'auto',
-    input: [{ role: 'user', content }]
+    input: [
+      {
+        role: 'user',
+        content,
+      },
+    ],
   });
 
-  return response.output_text;
+  return response.output_text?.trim() || 'Не удалось получить ответ от модели.';
 }
 
-// ================= BOT =================
-
-bot.start((ctx) => {
+bot.start(async (ctx) => {
   resetSession(ctx.chat.id);
-  ctx.reply('Подгрузи фотографии товара', keyboard());
+  await ctx.reply('Подгрузи фотографии товара', getMainKeyboard());
 });
 
-// Фото
+bot.hears('Начать заново', async (ctx) => {
+  resetSession(ctx.chat.id);
+  await ctx.reply('Подгрузи фотографии товара', getMainKeyboard());
+});
+
+bot.hears('Очистить', async (ctx) => {
+  resetSession(ctx.chat.id);
+  await ctx.reply(
+    'Все загруженные фото удалены. Подгрузи фотографии товара заново.',
+    getMainKeyboard()
+  );
+});
+
 bot.on('photo', async (ctx) => {
-  const session = getSession(ctx.chat.id);
+  const chatId = ctx.chat.id;
+  const session = ensureSession(chatId);
 
   if (session.processing) {
-    return ctx.reply('Я уже обрабатываю фото...');
+    await ctx.reply('Подожди, я уже обрабатываю предыдущую пачку фотографий.');
+    return;
   }
 
   if (session.photos.length >= MAX_PHOTOS) {
-    return ctx.reply('Можно загрузить максимум 3 фото', keyboard());
+    await ctx.reply(
+      `Можно загрузить максимум ${MAX_PHOTOS} фото за один раз. Нажми "Готово" или "Очистить".`,
+      getMainKeyboard()
+    );
+    return;
   }
 
-  const photo = ctx.message.photo.pop();
-  session.photos.push(photo.file_id);
+  const photos = ctx.message.photo;
+  const bestPhoto = photos[photos.length - 1];
 
-  ctx.reply(`Фото добавлено (${session.photos.length}/3)`, keyboard());
+  session.photos.push(bestPhoto.file_id);
+
+  await ctx.reply(
+    `Фото загружено. Сейчас в наборе: ${session.photos.length}.\nМожешь отправить ещё фото или нажать "Готово".`,
+    getMainKeyboard()
+  );
 });
 
-// Очистка
-bot.hears('Очистить', (ctx) => {
-  resetSession(ctx.chat.id);
-  ctx.reply('Фото очищены', keyboard());
-});
-
-// Готово
 bot.hears('Готово', async (ctx) => {
-  const session = getSession(ctx.chat.id);
-
-  if (!session.photos.length) {
-    return ctx.reply('Сначала загрузи фото');
-  }
+  const chatId = ctx.chat.id;
+  const session = ensureSession(chatId);
 
   if (session.processing) {
-    return ctx.reply('Подожди...');
+    await ctx.reply('Подожди, я уже обрабатываю фото.');
+    return;
+  }
+
+  if (!session.photos.length) {
+    await ctx.reply('Сначала подгрузи хотя бы одну фотографию товара.', getMainKeyboard());
+    return;
   }
 
   session.processing = true;
 
   try {
-    ctx.reply('Обрабатываю...');
-
-    // 🔥 получаем изображения
-    const images = [];
-
-    for (const fileId of session.photos) {
-      const img = await getImageDataUrl(fileId);
-      images.push(img);
+    if (!process.env.OPENAI_API_KEY) {
+      throw new Error('OPENAI_API_KEY is missing');
     }
 
-    // 🔥 проверка кеша
-    const hash = generateHash(images);
+    await ctx.reply('Обрабатываю фотографии, это может занять до минуты…');
+
+    const imageDataUrls = [];
+    for (const fileId of session.photos) {
+      const dataUrl = await telegramFileToDataUrl(fileId);
+      imageDataUrls.push(dataUrl);
+    }
+
+    const hash = generateHash(imageDataUrls);
 
     if (cache.has(hash)) {
-      await ctx.reply(cache.get(hash), restartKeyboard());
-      resetSession(ctx.chat.id);
+      await ctx.reply(escapeHtml(cache.get(hash)), {
+        parse_mode: 'HTML',
+        ...getRestartKeyboard(),
+      });
+      resetSession(chatId);
       return;
     }
 
-    // 🔥 запрос в OpenAI
-    const result = await analyze(images);
+    const result = await analyzeProductImages(imageDataUrls);
 
-    // 🔥 сохраняем в кеш
     cache.set(hash, result);
 
-    await ctx.reply(result, restartKeyboard());
+    await ctx.reply(escapeHtml(result), {
+      parse_mode: 'HTML',
+      ...getRestartKeyboard(),
+    });
 
-    resetSession(ctx.chat.id);
+    resetSession(chatId);
+  } catch (error) {
+    console.error('=== ERROR START ===');
+    console.error('message:', error?.message);
+    console.error('status:', error?.status);
+    console.error('name:', error?.name);
+    console.error('stack:', error?.stack);
+    console.error('full error:', error);
+    console.error('=== ERROR END ===');
 
-  } catch (e) {
-    console.error(e);
     session.processing = false;
-    ctx.reply('Ошибка обработки');
+
+    let userMessage = 'Не получилось обработать фотографии. Попробуй ещё раз.';
+
+    if (error?.message?.includes('OPENAI_API_KEY')) {
+      userMessage = 'Не настроен OPENAI_API_KEY в Railway.';
+    } else if (error?.status === 401) {
+      userMessage = 'Ошибка авторизации OpenAI API. Проверь OPENAI_API_KEY.';
+    } else if (error?.status === 429 || error?.code === 'insufficient_quota') {
+      userMessage = 'Сервис временно недоступен: закончилась квота OpenAI API. Попробуй позже.';
+    } else if (error?.status === 400) {
+      userMessage = 'OpenAI отклонил запрос. Попробуй отправить 1–2 более чётких фото.';
+    }
+
+    await ctx.reply(userMessage, getMainKeyboard());
   }
 });
 
-// fallback
-bot.on('message', (ctx) => {
+bot.on('message', async (ctx) => {
   if (ctx.message.photo) return;
-  ctx.reply('Отправь фото товара');
+
+  await ctx.reply(
+    'Подгрузи фотографии товара. Когда закончишь, нажми "Готово".',
+    getMainKeyboard()
+  );
 });
 
 bot.launch();
