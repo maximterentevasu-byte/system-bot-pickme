@@ -10,10 +10,7 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
-// Храним сессию по chatId
 const sessions = new Map();
-
-// Ограничим количество фото, чтобы не раздувать запрос
 const MAX_PHOTOS = 3;
 
 function getMainKeyboard() {
@@ -31,7 +28,6 @@ function ensureSession(chatId) {
       processing: false,
     });
   }
-
   return sessions.get(chatId);
 }
 
@@ -49,7 +45,26 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;');
 }
 
+function guessMimeType(filePath = '', responseContentType = '') {
+  const lowerPath = String(filePath).toLowerCase();
+  const lowerContentType = String(responseContentType).toLowerCase();
+
+  if (lowerContentType.startsWith('image/jpeg')) return 'image/jpeg';
+  if (lowerContentType.startsWith('image/jpg')) return 'image/jpeg';
+  if (lowerContentType.startsWith('image/png')) return 'image/png';
+  if (lowerContentType.startsWith('image/webp')) return 'image/webp';
+  if (lowerContentType.startsWith('image/gif')) return 'image/gif';
+
+  if (lowerPath.endsWith('.jpg') || lowerPath.endsWith('.jpeg')) return 'image/jpeg';
+  if (lowerPath.endsWith('.png')) return 'image/png';
+  if (lowerPath.endsWith('.webp')) return 'image/webp';
+  if (lowerPath.endsWith('.gif')) return 'image/gif';
+
+  return 'image/jpeg';
+}
+
 async function telegramFileToDataUrl(fileId) {
+  const fileInfo = await bot.telegram.getFile(fileId);
   const fileLink = await bot.telegram.getFileLink(fileId);
 
   const response = await axios.get(fileLink.href, {
@@ -59,10 +74,13 @@ async function telegramFileToDataUrl(fileId) {
     maxBodyLength: 20 * 1024 * 1024,
   });
 
-  const contentType = response.headers['content-type'] || 'image/jpeg';
-  const base64 = Buffer.from(response.data).toString('base64');
+  const mimeType = guessMimeType(
+    fileInfo?.file_path || '',
+    response.headers['content-type'] || ''
+  );
 
-  return `data:${contentType};base64,${base64}`;
+  const base64 = Buffer.from(response.data).toString('base64');
+  return `data:${mimeType};base64,${base64}`;
 }
 
 async function analyzeProductImages(imageDataUrls) {
@@ -92,6 +110,8 @@ async function analyzeProductImages(imageDataUrls) {
 - Ничего не выдумывай.
 - Если данных нет на фото, пиши: не указано.
 - "Описание товара" должно быть коротким, продающим, 1–3 предложения.
+- Если КБЖУ не видно, так и напиши.
+- Если штрихкод не читается, напиши: не указано.
 - Ответ только на русском языке.
       `.trim(),
     },
@@ -222,7 +242,7 @@ bot.hears('Готово', async (ctx) => {
     } else if (error?.status === 429) {
       userMessage = 'Превышен лимит OpenAI API или закончился баланс.';
     } else if (error?.status === 400) {
-      userMessage = 'OpenAI отклонил запрос. Попробуй меньше фото или более чёткие снимки.';
+      userMessage = 'OpenAI отклонил запрос. Попробуй 1–2 более чётких фото.';
     }
 
     await ctx.reply(userMessage, getMainKeyboard());
