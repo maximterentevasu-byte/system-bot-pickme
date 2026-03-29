@@ -29,8 +29,8 @@ const drive = google.drive({ version: 'v3', auth });
 const SPREADSHEET_ID = '1MfHUleOrA6aV95tnBKyBywe3bSO9PmdCvX8OaMvGz1A';
 const TABLE_URL =
   'https://docs.google.com/spreadsheets/d/1MfHUleOrA6aV95tnBKyBywe3bSO9PmdCvX8OaMvGz1A/edit';
-const SHEET_RANGE = 'Sheet1!A1';
-const BARCODE_COLUMN_RANGE = 'Sheet1!E:E';
+const SHEET_RANGE = 'RUSIFIK!A1';
+const BARCODE_COLUMN_RANGE = 'RUSIFIK!E:E';
 
 const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || '';
 
