@@ -65,7 +65,6 @@ bot.on('photo', async (ctx) => {
   }
 
   if (state === 'catalog') {
-    // здесь должна быть логика распознавания ШК
     const row = await findProductByBarcode(photo.file_id);
 
     if (!row) {
@@ -73,13 +72,13 @@ bot.on('photo', async (ctx) => {
     }
 
     const message = [
-      row[8],  // I
-      row[6],  // G
-      row[7],  // H
-      row[10], // K
-      row[11], // L
-      row[12], // M
-      row[9]   // J
+      row[8],
+      row[6],
+      row[7],
+      row[10],
+      row[11],
+      row[12],
+      row[9]
     ]
       .filter(v => v && v.toString().trim() !== "")
       .join('\n\n');
@@ -90,7 +89,6 @@ bot.on('photo', async (ctx) => {
 
 // ====== ФЕЙК ФУНКЦИЯ ПОИСКА ======
 async function findProductByBarcode(fileId) {
-  // здесь твоя логика поиска в Google Sheets
   return null;
 }
 
