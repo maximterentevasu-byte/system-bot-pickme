@@ -115,8 +115,12 @@ function normalizeBarcode(value) {
 function isValidEan13(barcode) {
   const digitsOnly = normalizeBarcode(barcode);
 
-  if (!/^\d{13}$/.test(digitsOnly)) {
+  if (!/^\d{8,13}$/.test(digitsOnly)) {
     return false;
+  }
+
+  if (digitsOnly.length !== 13) {
+    return true;
   }
 
   const digits = digitsOnly.split('').map(Number);
@@ -491,7 +495,7 @@ async function extractBarcodeFromImages(images) {
 - Ответ только JSON без markdown и пояснений.
 - Верни поле barcode.
 - Если штрихкод не виден чётко или есть сомнение хотя бы в одной цифре, верни "не найден".
-- Штрихкод должен быть только из 13 цифр, без пробелов и символов.
+- Штрихкод должен быть только из 8–13 цифр, без пробелов и символов.
 
 Формат ответа:
 {
