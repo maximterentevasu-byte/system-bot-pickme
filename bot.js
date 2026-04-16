@@ -128,6 +128,96 @@ function parseModelJson(rawText) {
   }
 }
 
+function barcodeMatches(sheetBarcode, targetBarcode) {
+  const left = normalizeBarcode(sheetBarcode);
+  const right = normalizeBarcode(targetBarcode);
+
+  if (!left || !right) return false;
+  if (left === right) return true;
+
+  // На случай, если Google Sheets ранее сохранил ШК числом и отбросил ведущий ноль.
+  if (left.length === 12 && right.length === 13 && right.startsWith('0') && right.slice(1) === left) {
+    return true;
+  }
+
+  if (right.length === 12 && left.length === 13 && left.startsWith('0') && left.slice(1) === right) {
+    return true;
+  }
+
+  return false;
+}
+
+async function generateExtraFields(data) {
+  const response = await openai.responses.create({
+    model: 'gpt-4.1-mini',
+    input: [{
+      role: 'user',
+      content: [{
+        type: 'input_text',
+        text: `Ты анализируешь продукт для карточки товара.
+Верни только JSON без markdown и пояснений.
+Все поля только на русском языке.
+Не оставляй пустые поля: если точных данных нет, аккуратно укажи "не указано".
+
+Нужно вернуть JSON строго такого формата:
+{
+  "spice": "Категория: ...\nScoville (SHU): ...\nШкала: ...",
+  "acid": "Категория: ...\npH: ...\nШкала: ...",
+  "k": "Вкусовые характеристики товара / описание вкуса / описание визуала / кому понравится товар / всё важное для принятия решения о покупке.",
+  "l": "Как приготовить / как употреблять (готов к употреблению или нужно готовить) / самостоятельное блюдо или нет / с чем сочетается.",
+  "m": "Самый популярный рецепт приготовления / ссылка на рецепт на русском языке, если есть, иначе напиши: Ссылка: не указано"
+}
+
+Правила для остроты (5 категорий):
+1. Не острое
+2. Слабо острое
+3. Средне острое
+4. Острое
+5. Очень острое
+
+Правила для кислотности (5 категорий):
+1. Не кислое
+2. Слабо кислое
+3. Средне кислое
+4. Кислое
+5. Очень кислое
+
+Если точные SHU или pH не указаны, оцени по типу продукта, вкусу и описанию, но честно пиши "не указано" в строке SHU или pH, а категорию и шкалу всё равно определи максимально разумно.
+
+Шкалы остроты:
+- Не острое: 0-500
+- Слабо острое: 501-2500
+- Средне острое: 2501-15000
+- Острое: 15001-50000
+- Очень острое: 50001+
+
+Шкалы кислотности:
+- Не кислое: 6.1-7.0
+- Слабо кислое: 5.1-6.0
+- Средне кислое: 4.1-5.0
+- Кислое: 3.1-4.0
+- Очень кислое: 0-3.0
+
+Данные о товаре:
+Название: ${data.name || 'не указано'}
+Описание: ${data.description || 'не указано'}
+Детали: ${data.details || 'не указано'}
+Производитель: ${data.manufacturer || 'не указано'}
+Штрихкод: ${data.barcode || 'не указано'}`
+      }]
+    }]
+  });
+
+  const parsed = parseModelJson(response.output_text);
+  return {
+    spice: String(parsed?.spice || '').trim(),
+    acid: String(parsed?.acid || '').trim(),
+    k: String(parsed?.k || '').trim(),
+    l: String(parsed?.l || '').trim(),
+    m: String(parsed?.m || '').trim(),
+  };
+}
+
 function getPhotoLimit(session) {
   return session.barcodeRetryMode ? RETRY_MAX_PHOTOS : INITIAL_MAX_PHOTOS;
 }
@@ -329,13 +419,13 @@ async function uploadPhotoToDrive(buffer, mimeType, fileName) {
 }
 
 
+
 async function writeToGoogleSheets(data, photoUrl) {
   const photoCellValue = photoUrl ? `=IMAGE("${photoUrl}")` : '';
 
-  // get all rows
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
-    range: SHEET_RANGE,
+    range: 'RUSIFIK!A:M',
   });
 
   const rows = res.data.values || [];
@@ -343,24 +433,14 @@ async function writeToGoogleSheets(data, photoUrl) {
 
   let rowIndex = -1;
 
-  for (let i = 0; i < rows.length; i++) {
-    if (normalizeBarcode(rows[i][4]) === barcode) {
+  for (let i = 1; i < rows.length; i++) {
+    if (barcodeMatches(rows[i][4], barcode)) {
       rowIndex = i;
       break;
     }
   }
 
-  // generate extra fields via AI
-  const extra = await openai.responses.create({
-    model: "gpt-4.1-mini",
-    input: `Определи характеристики товара:
-${data.name}
-${data.description}
-Верни JSON с полями: spice, acid, k, l, m`
-  });
-
-  let parsed = {};
-  try { parsed = JSON.parse(extra.output_text); } catch {}
+  const extra = await generateExtraFields(data);
 
   if (rowIndex === -1) {
     await sheets.spreadsheets.values.append({
@@ -369,49 +449,60 @@ ${data.description}
       valueInputOption: 'USER_ENTERED',
       requestBody: {
         values: [[
-          data.name,
-          data.description,
-          data.details,
-          data.manufacturer,
-          data.barcode,
+          data.name || '',
+          data.description || '',
+          data.details || '',
+          data.manufacturer || '',
+          `'${barcode}`,
           photoCellValue,
-          parsed.spice || '',
-          parsed.acid || '',
+          extra.spice || '',
+          extra.acid || '',
           '',
           '',
-          parsed.k || '',
-          parsed.l || '',
-          parsed.m || ''
+          extra.k || '',
+          extra.l || '',
+          extra.m || '',
         ]],
       },
     });
-  } else {
-    const row = rows[rowIndex];
-
-    const updated = [...row];
-
-    function setIfEmpty(index, value) {
-      if (!updated[index] || updated[index].trim() === '') {
-        updated[index] = value;
-      }
-    }
-
-    setIfEmpty(6, parsed.spice || '');
-    setIfEmpty(7, parsed.acid || '');
-    setIfEmpty(10, parsed.k || '');
-    setIfEmpty(11, parsed.l || '');
-    setIfEmpty(12, parsed.m || '');
-
-    await sheets.spreadsheets.values.update({
-      spreadsheetId: SPREADSHEET_ID,
-      range: `RUSIFIK!A${rowIndex+1}:M${rowIndex+1}`,
-      valueInputOption: 'USER_ENTERED',
-      requestBody: {
-        values: [updated],
-      },
-    });
+    return;
   }
+
+  const row = rows[rowIndex] || [];
+  const updated = Array.from({ length: 13 }, (_, index) => row[index] || '');
+
+  function isEmptyCell(value) {
+    return value === undefined || value === null || String(value).trim() === '';
+  }
+
+  function setIfEmpty(index, value) {
+    if (!isEmptyCell(value) && isEmptyCell(updated[index])) {
+      updated[index] = value;
+    }
+  }
+
+  setIfEmpty(0, data.name || '');
+  setIfEmpty(1, data.description || '');
+  setIfEmpty(2, data.details || '');
+  setIfEmpty(3, data.manufacturer || '');
+  setIfEmpty(4, `'${barcode}`);
+  setIfEmpty(5, photoCellValue);
+  setIfEmpty(6, extra.spice || '');
+  setIfEmpty(7, extra.acid || '');
+  setIfEmpty(10, extra.k || '');
+  setIfEmpty(11, extra.l || '');
+  setIfEmpty(12, extra.m || '');
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `RUSIFIK!A${rowIndex + 1}:M${rowIndex + 1}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: {
+      values: [updated],
+    },
+  });
 }
+
 
 
 // ===== BOT =====
