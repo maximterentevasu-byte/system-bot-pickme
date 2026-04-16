@@ -328,25 +328,91 @@ async function uploadPhotoToDrive(buffer, mimeType, fileName) {
   return `https://drive.google.com/uc?export=view&id=${fileId}`;
 }
 
+
 async function writeToGoogleSheets(data, photoUrl) {
   const photoCellValue = photoUrl ? `=IMAGE("${photoUrl}")` : '';
 
-  await sheets.spreadsheets.values.append({
+  // get all rows
+  const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: SHEET_RANGE,
-    valueInputOption: 'USER_ENTERED',
-    requestBody: {
-      values: [[
-        data.name,
-        data.description,
-        data.details,
-        data.manufacturer,
-        data.barcode,
-        photoCellValue,
-      ]],
-    },
   });
+
+  const rows = res.data.values || [];
+  const barcode = normalizeBarcode(data.barcode);
+
+  let rowIndex = -1;
+
+  for (let i = 0; i < rows.length; i++) {
+    if (normalizeBarcode(rows[i][4]) === barcode) {
+      rowIndex = i;
+      break;
+    }
+  }
+
+  // generate extra fields via AI
+  const extra = await openai.responses.create({
+    model: "gpt-4.1-mini",
+    input: `Определи характеристики товара:
+${data.name}
+${data.description}
+Верни JSON с полями: spice, acid, k, l, m`
+  });
+
+  let parsed = {};
+  try { parsed = JSON.parse(extra.output_text); } catch {}
+
+  if (rowIndex === -1) {
+    await sheets.spreadsheets.values.append({
+      spreadsheetId: SPREADSHEET_ID,
+      range: SHEET_RANGE,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        values: [[
+          data.name,
+          data.description,
+          data.details,
+          data.manufacturer,
+          data.barcode,
+          photoCellValue,
+          parsed.spice || '',
+          parsed.acid || '',
+          '',
+          '',
+          parsed.k || '',
+          parsed.l || '',
+          parsed.m || ''
+        ]],
+      },
+    });
+  } else {
+    const row = rows[rowIndex];
+
+    const updated = [...row];
+
+    function setIfEmpty(index, value) {
+      if (!updated[index] || updated[index].trim() === '') {
+        updated[index] = value;
+      }
+    }
+
+    setIfEmpty(6, parsed.spice || '');
+    setIfEmpty(7, parsed.acid || '');
+    setIfEmpty(10, parsed.k || '');
+    setIfEmpty(11, parsed.l || '');
+    setIfEmpty(12, parsed.m || '');
+
+    await sheets.spreadsheets.values.update({
+      spreadsheetId: SPREADSHEET_ID,
+      range: `RUSIFIK!A${rowIndex+1}:M${rowIndex+1}`,
+      valueInputOption: 'USER_ENTERED',
+      requestBody: {
+        values: [updated],
+      },
+    });
+  }
 }
+
 
 // ===== BOT =====
 
