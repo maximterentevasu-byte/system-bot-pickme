@@ -76,6 +76,7 @@ function spiceCheckKeyboard() {
   return Markup.keyboard([
     ['Готово'],
     ['Очистить'],
+    ['Открыть таблицу'],
     ['⬅️ Главное меню'],
   ]).resize();
 }
@@ -356,6 +357,7 @@ function formatSpiceAcidFields(result) {
   };
 }
 
+
 function escapeHtml(text) {
   return String(text || '')
     .replace(/&/g, '&amp;')
@@ -363,19 +365,22 @@ function escapeHtml(text) {
     .replace(/>/g, '&gt;');
 }
 
-function formatSpiceAcidAnalysisResponse(result) {
+function formatSpiceAcidResultMessage(result) {
+  const spiciness = result.spiciness;
+  const acidity = result.acidity;
+
   return [
     `📦 <b>Тип товара</b>: ${escapeHtml(result.product_type)}`,
     '',
     `🌶 <b>Оценка остроты</b>`,
-    `Категория: <b>${escapeHtml(result.spiciness.level_label)}</b>`,
-    `Scoville (SHU): <b>${escapeHtml(result.spiciness.estimated_shu)}</b>`,
-    `Шкала: <b>${escapeHtml(result.spiciness.shu_range)}</b>`,
+    `Категория: <b>${escapeHtml(spiciness.level_label)}</b>`,
+    `Scoville (SHU): <b>${escapeHtml(spiciness.estimated_shu)}</b>`,
+    `Шкала: <b>${escapeHtml(spiciness.shu_range)}</b>`,
     '',
     `🍋 <b>Оценка кислотности</b>`,
-    `Категория: <b>${escapeHtml(result.acidity.level_label)}</b>`,
-    `pH: <b>${escapeHtml(result.acidity.estimated_ph)}</b>`,
-    `Шкала: <b>${escapeHtml(result.acidity.ph_range)}</b>`,
+    `Категория: <b>${escapeHtml(acidity.level_label)}</b>`,
+    `pH: <b>${escapeHtml(acidity.estimated_ph)}</b>`,
+    `Шкала: <b>${escapeHtml(acidity.ph_range)}</b>`,
     '',
     `🧠 <b>Обоснование</b>`,
     `${escapeHtml(result.reasoning)}`,
@@ -385,80 +390,6 @@ function formatSpiceAcidAnalysisResponse(result) {
     '',
     `<i>Это оценка по фото, названию и составу товара, а не лабораторное измерение.</i>`,
   ].join('\n');
-}
-
-async function analyzeSpiceAcidFromImages(imageDataUrls) {
-  const content = [{
-    type: 'input_text',
-    text: `Ты эксперт по анализу пищевых товаров по фото упаковки.
-
-ЗАДАЧА:
-По фото товара определи оценочную:
-1. остроту в шкале Сковилла (SHU)
-2. кислотность в pH
-3. тип продукта
-
-ИСПОЛЬЗУЙ:
-- название товара
-- вкус
-- состав
-- надписи на упаковке
-- тип продукта
-- изображения ингредиентов на упаковке
-- слова и маркеры вроде: spicy, hot, extra hot, chili, pepper, jalapeno, habanero, kimchi, wasabi, sour, vinegar, citric acid, malic acid, lactic acid, pickle и похожие
-
-ПРАВИЛА:
-- Нельзя выдавать лабораторно-точные значения.
-- Нужно дать реалистичную экспертную оценку по упаковке.
-- Если данных мало, всё равно дай осторожную оценку, но уменьши confidence и укажи warning.
-- Не выдумывай экстремальную остроту или кислотность без подтверждения на упаковке.
-- reasoning должно быть коротким, понятным и на русском языке, 1–3 предложения.
-- Ответ только JSON, без markdown и без пояснений.
-
-ШКАЛА ОСТРОТЫ:
-- Не острое: 0-500 SHU
-- Слабо острое: 501-2500 SHU
-- Средне острое: 2501-15000 SHU
-- Острое: 15001-50000 SHU
-- Очень острое: 50001+ SHU
-
-ШКАЛА КИСЛОТНОСТИ:
-- Не кислое: pH 6.1-7.0
-- Слабо кислое: pH 5.1-6.0
-- Средне кислое: pH 4.1-5.0
-- Кислое: pH 3.1-4.0
-- Очень кислое: pH 0-3.0
-
-ФОРМАТ ОТВЕТА:
-{
-  "product_type": "",
-  "spiciness": {
-    "estimated_shu": ""
-  },
-  "acidity": {
-    "estimated_ph": ""
-  },
-  "confidence": "высокая | средняя | низкая",
-  "warnings": "",
-  "reasoning": ""
-}`
-  }];
-
-  for (const img of imageDataUrls) {
-    content.push({
-      type: 'input_image',
-      image_url: img,
-      detail: 'low',
-    });
-  }
-
-  const response = await openai.responses.create({
-    model: OPENAI_MODEL,
-    input: [{ role: 'user', content }],
-  });
-
-  const parsed = parseModelJson(response.output_text);
-  return sanitizeSpiceAcidResult(parsed);
 }
 
 async function analyzeSpiceAcid(data) {
@@ -982,9 +913,10 @@ bot.hears('Каталог товаров', async (ctx) => {
   await ctx.reply('Пришли фото штрихкода товара. Можно добавить до 3 фото, затем нажми "Найти товар".', catalogKeyboard());
 });
 
+
 bot.hears('Проверка Остроты/Кислотности', async (ctx) => {
-  resetSession(ctx.chat.id, 'spice');
-  await ctx.reply('Загрузи до 3 фото товара, затем нажми "Готово". Я определю оценочную остроту в SHU и кислотность в pH.', spiceCheckKeyboard());
+  resetSession(ctx.chat.id, 'spicecheck');
+  await ctx.reply('Подгрузи фотографии товара. Можно добавить до 5 фото, затем нажми "Готово".', spiceCheckKeyboard());
 });
 
 bot.hears('⬅️ Главное меню', async (ctx) => {
@@ -1005,8 +937,8 @@ bot.hears('Очистить', async (ctx) => {
     return;
   }
 
-  if (session.mode === 'spice') {
-    await ctx.reply('Все загруженные фото очищены. Загрузи товар заново.', spiceCheckKeyboard());
+  if (session.mode === 'spicecheck') {
+    await ctx.reply('Все загруженные фото очищены. Подгрузи фотографии товара заново.', spiceCheckKeyboard());
     return;
   }
 
@@ -1021,17 +953,17 @@ bot.on('photo', async (ctx) => {
     return;
   }
 
-  if (session.mode !== 'add' && session.mode !== 'catalog' && session.mode !== 'spice') {
+  if (session.mode !== 'add' && session.mode !== 'catalog' && session.mode !== 'spicecheck') {
     await ctx.reply('Сначала выбери раздел в главном меню.', mainMenuKeyboard());
     return;
   }
 
-  const currentLimit = session.mode === 'catalog' ? CATALOG_MAX_PHOTOS : session.mode === 'spice' ? 3 : getPhotoLimit(session);
+  const currentLimit = session.mode === 'catalog' ? CATALOG_MAX_PHOTOS : getPhotoLimit(session);
 
   if (session.photos.length >= currentLimit) {
     await ctx.reply(
       `Сейчас можно загрузить максимум ${currentLimit} фото. Нажми "${session.mode === 'catalog' ? 'Найти товар' : 'Готово'}" или "Очистить".`,
-      session.mode === 'catalog' ? catalogKeyboard() : session.mode === 'spice' ? spiceCheckKeyboard() : productKeyboard()
+      session.mode === 'catalog' ? catalogKeyboard() : (session.mode === 'spicecheck' ? spiceCheckKeyboard() : productKeyboard())
     );
     return;
   }
@@ -1047,23 +979,15 @@ bot.on('photo', async (ctx) => {
     return;
   }
 
-  if (session.mode === 'spice') {
-    await ctx.reply(
-      `Фото добавлено (${session.photos.length}/${currentLimit}). Когда закончишь, нажми "Готово".`,
-      spiceCheckKeyboard()
-    );
-    return;
-  }
-
   if (session.barcodeRetryMode) {
     await ctx.reply(
       `Дополнительное фото добавлено (${session.photos.length}/${currentLimit}). Когда закончишь, нажми "Готово".`,
-      productKeyboard()
+      session.mode === 'spicecheck' ? spiceCheckKeyboard() : productKeyboard()
     );
   } else {
     await ctx.reply(
       `Фото добавлено (${session.photos.length}/${currentLimit}). Когда закончишь, нажми "Готово".`,
-      productKeyboard()
+      session.mode === 'spicecheck' ? spiceCheckKeyboard() : productKeyboard()
     );
   }
 });
@@ -1129,59 +1053,12 @@ bot.hears('Найти товар', async (ctx) => {
 bot.hears('Готово', async (ctx) => {
   const session = getSession(ctx.chat.id);
 
-  if (session.mode === 'spice') {
-    if (session.processing) {
-      await ctx.reply('Подожди, я уже обрабатываю фото.');
-      return;
-    }
-
-    if (!session.photos.length) {
-      await ctx.reply('Сначала загрузи хотя бы одну фотографию товара.', spiceCheckKeyboard());
-      return;
-    }
-
-    session.processing = true;
-
-    try {
-      await ctx.reply('Анализирую товар...');
-
-      const imageDataUrls = [];
-      for (const fileId of session.photos) {
-        const meta = await getTelegramFileMeta(fileId);
-        imageDataUrls.push(bufferToDataUrl(meta.buffer, meta.mimeType));
-      }
-
-      const hash = makeImageCacheHash(imageDataUrls);
-      let result;
-
-      if (cache.has(`spice:${hash}`)) {
-        result = cache.get(`spice:${hash}`);
-      } else {
-        result = await analyzeSpiceAcidFromImages(imageDataUrls);
-        cache.set(`spice:${hash}`, result);
-      }
-
-      resetSession(ctx.chat.id, 'spice');
-      await ctx.replyWithHTML(formatSpiceAcidAnalysisResponse(result), spiceCheckKeyboard());
-      return;
-    } catch (e) {
-      console.error('=== SPICE MODE ERROR START ===');
-      console.error(e);
-      console.error('=== SPICE MODE ERROR END ===');
-
-      session.processing = false;
-      await ctx.reply(
-        'Ошибка обработки. Попробуй отправить более чёткие фото товара, состава и лицевой стороны упаковки или нажми "Очистить".',
-        spiceCheckKeyboard()
-      );
-      return;
-    }
-  }
-
-  if (session.mode !== 'add') {
-    await ctx.reply('Сначала выбери раздел "Добавить новый товар в таблицу".', mainMenuKeyboard());
+  if (session.mode !== 'add' && session.mode !== 'spicecheck') {
+    await ctx.reply('Сначала выбери нужный раздел в главном меню.', mainMenuKeyboard());
     return;
   }
+
+  const currentKeyboard = session.mode === 'spicecheck' ? spiceCheckKeyboard() : productKeyboard();
 
   if (session.processing) {
     await ctx.reply('Подожди, я уже обрабатываю фото.');
@@ -1189,14 +1066,14 @@ bot.hears('Готово', async (ctx) => {
   }
 
   if (!session.photos.length) {
-    await ctx.reply('Сначала загрузи хотя бы одну фотографию товара.', productKeyboard());
+    await ctx.reply('Сначала загрузи хотя бы одну фотографию товара.', currentKeyboard);
     return;
   }
 
   session.processing = true;
 
   try {
-    await ctx.reply('Обрабатываю фотографии...');
+    await ctx.reply(session.mode === 'spicecheck' ? 'Анализирую товар...' : 'Обрабатываю фотографии...');
 
     const imageMetaList = [];
     const imageDataUrls = [];
@@ -1224,7 +1101,7 @@ bot.hears('Готово', async (ctx) => {
       session.processing = false;
       session.barcodeRetryMode = true;
 
-      await ctx.reply(getBarcodeRetryMessage(), productKeyboard());
+      await ctx.reply(getBarcodeRetryMessage(), currentKeyboard);
       return;
     }
 
@@ -1247,7 +1124,7 @@ bot.hears('Готово', async (ctx) => {
         session.processing = false;
         await ctx.reply(
           `Не хватает данных для заполнения столбца - ${fields[key]}. Пришли дополнительные фото и снова нажми "Готово".`,
-          productKeyboard()
+          currentKeyboard
         );
         return;
       }
@@ -1271,6 +1148,13 @@ bot.hears('Готово', async (ctx) => {
 
     await writeToGoogleSheets(result, photoUrl);
 
+    if (session.mode === 'spicecheck') {
+      const spiceAcidResult = await analyzeSpiceAcid(result);
+      resetSession(ctx.chat.id, 'spicecheck');
+      await ctx.replyWithHTML(formatSpiceAcidResultMessage(spiceAcidResult), spiceCheckKeyboard());
+      return;
+    }
+
     resetSession(ctx.chat.id, 'add');
     await ctx.reply('✅ Товар записан в таблицу', productKeyboard());
   } catch (e) {
@@ -1281,7 +1165,7 @@ bot.hears('Готово', async (ctx) => {
     session.processing = false;
     await ctx.reply(
       'Ошибка обработки. Попробуй ещё раз или нажми "Очистить".',
-      productKeyboard()
+      currentKeyboard
     );
   }
 });
@@ -1301,8 +1185,8 @@ bot.on('message', async (ctx) => {
     return;
   }
 
-  if (session.mode === 'spice') {
-    await ctx.reply('Загрузи до 3 фото товара или вернись в главное меню.', spiceCheckKeyboard());
+  if (session.mode === 'spicecheck') {
+    await ctx.reply('Подгрузи фотографии товара или вернись в главное меню.', spiceCheckKeyboard());
     return;
   }
 
