@@ -540,16 +540,6 @@ bot.hears('Готово', async (ctx) => {
       }
     }
 
-    const existingBarcodes = await getAllBarcodes();
-    if (existingBarcodes.includes(result.barcode)) {
-      resetSession(ctx.chat.id);
-      await ctx.reply(
-        '⚠️ Товар с таким штрихкодом уже есть в таблице. Повторно добавлять его не нужно.',
-        tableButton()
-      );
-      return;
-    }
-
     let photoUrl = '';
 
     try {
