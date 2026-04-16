@@ -43,12 +43,31 @@ const cache = new Map();
 
 const INITIAL_MAX_PHOTOS = 5;
 const RETRY_MAX_PHOTOS = 10;
+const CATALOG_MAX_PHOTOS = 3;
 
-function keyboard() {
+function mainMenuKeyboard() {
+  return Markup.keyboard([
+    ['Добавить новый товар в таблицу'],
+    ['Каталог товаров'],
+    ['Открыть таблицу'],
+  ]).resize();
+}
+
+function productKeyboard() {
   return Markup.keyboard([
     ['Готово'],
     ['Очистить'],
     ['Открыть таблицу'],
+    ['⬅️ Главное меню'],
+  ]).resize();
+}
+
+function catalogKeyboard() {
+  return Markup.keyboard([
+    ['Найти товар'],
+    ['Очистить'],
+    ['Открыть таблицу'],
+    ['⬅️ Главное меню'],
   ]).resize();
 }
 
@@ -64,17 +83,27 @@ function getSession(chatId) {
       photos: [],
       processing: false,
       barcodeRetryMode: false,
+      mode: 'main',
     });
   }
   return sessions.get(chatId);
 }
 
-function resetSession(chatId) {
+function resetSession(chatId, mode = 'main') {
   sessions.set(chatId, {
     photos: [],
     processing: false,
     barcodeRetryMode: false,
+    mode,
   });
+}
+
+function clearSessionPhotos(chatId) {
+  const session = getSession(chatId);
+  session.photos = [];
+  session.processing = false;
+  session.barcodeRetryMode = false;
+  return session;
 }
 
 // ===== HELPERS =====
@@ -451,6 +480,78 @@ function getBarcodeRetryMessage() {
   );
 }
 
+
+async function extractBarcodeFromImages(images) {
+  const content = [
+    {
+      type: 'input_text',
+      text: `Ты извлекаешь только штрихкод товара с фотографии.
+
+Правила:
+- Ответ только JSON без markdown и пояснений.
+- Верни поле barcode.
+- Если штрихкод не виден чётко или есть сомнение хотя бы в одной цифре, верни "не найден".
+- Штрихкод должен быть только из 13 цифр, без пробелов и символов.
+
+Формат ответа:
+{
+  "barcode": ""
+}`
+    },
+  ];
+
+  for (const img of images) {
+    content.push({
+      type: 'input_image',
+      image_url: img,
+      detail: 'low',
+    });
+  }
+
+  const response = await openai.responses.create({
+    model: OPENAI_MODEL,
+    input: [{ role: 'user', content }],
+  });
+
+  const parsed = parseModelJson(response.output_text);
+  return normalizeBarcode(parsed?.barcode);
+}
+
+async function findRowByBarcode(barcode) {
+  const normalized = normalizeBarcode(barcode);
+  if (!normalized) return null;
+
+  const res = await sheets.spreadsheets.values.get({
+    spreadsheetId: SPREADSHEET_ID,
+    range: 'RUSIFIK!A:M',
+    valueRenderOption: 'FORMATTED_VALUE',
+  });
+
+  const rows = res.data.values || [];
+
+  for (let i = 1; i < rows.length; i++) {
+    if (barcodeMatches(rows[i][4], normalized)) {
+      return { rowIndex: i, rowNumber: i + 1, row: rows[i] };
+    }
+  }
+
+  return null;
+}
+
+function formatCatalogResponse(row) {
+  const parts = [
+    ['I', row[8]],
+    ['G', row[6]],
+    ['H', row[7]],
+    ['K', row[10]],
+    ['L', row[11]],
+    ['M', row[12]],
+    ['J', row[9]],
+  ].map(([col, value]) => `${col}:\n${String(value || 'не указано').trim() || 'не указано'}`);
+
+  return parts.join('\n\n');
+}
+
 // ===== TELEGRAM FILES =====
 
 async function getTelegramFileMeta(fileId) {
@@ -744,20 +845,43 @@ async function writeToGoogleSheets(data, photoUrl) {
 // ===== BOT =====
 
 bot.start(async (ctx) => {
-  resetSession(ctx.chat.id);
-  await ctx.reply('Подгрузи фотографии товара', keyboard());
+  resetSession(ctx.chat.id, 'main');
+  await ctx.reply('Главное меню:', mainMenuKeyboard());
 });
 
 bot.hears('Открыть таблицу', async (ctx) => {
   await ctx.reply('Открыть Google Sheets:', tableButton());
 });
 
+bot.hears('Добавить новый товар в таблицу', async (ctx) => {
+  resetSession(ctx.chat.id, 'add');
+  await ctx.reply('Подгрузи фотографии товара. Можно добавить до 5 фото, затем нажми "Готово".', productKeyboard());
+});
+
+bot.hears('Каталог товаров', async (ctx) => {
+  resetSession(ctx.chat.id, 'catalog');
+  await ctx.reply('Пришли фото штрихкода товара. Можно добавить до 3 фото, затем нажми "Найти товар".', catalogKeyboard());
+});
+
+bot.hears('⬅️ Главное меню', async (ctx) => {
+  resetSession(ctx.chat.id, 'main');
+  await ctx.reply('Главное меню:', mainMenuKeyboard());
+});
+
 bot.hears('Очистить', async (ctx) => {
-  resetSession(ctx.chat.id);
-  await ctx.reply(
-    'Все загруженные фото очищены. Подгрузи фотографии товара заново.',
-    keyboard()
-  );
+  const session = clearSessionPhotos(ctx.chat.id);
+
+  if (session.mode === 'catalog') {
+    await ctx.reply('Фото очищены. Пришли фото штрихкода заново.', catalogKeyboard());
+    return;
+  }
+
+  if (session.mode === 'add') {
+    await ctx.reply('Все загруженные фото очищены. Подгрузи фотографии товара заново.', productKeyboard());
+    return;
+  }
+
+  await ctx.reply('Главное меню:', mainMenuKeyboard());
 });
 
 bot.on('photo', async (ctx) => {
@@ -768,12 +892,17 @@ bot.on('photo', async (ctx) => {
     return;
   }
 
-  const currentLimit = getPhotoLimit(session);
+  if (session.mode !== 'add' && session.mode !== 'catalog') {
+    await ctx.reply('Сначала выбери раздел в главном меню.', mainMenuKeyboard());
+    return;
+  }
+
+  const currentLimit = session.mode === 'catalog' ? CATALOG_MAX_PHOTOS : getPhotoLimit(session);
 
   if (session.photos.length >= currentLimit) {
     await ctx.reply(
-      `Сейчас можно загрузить максимум ${currentLimit} фото. Нажми "Готово" или "Очистить".`,
-      keyboard()
+      `Сейчас можно загрузить максимум ${currentLimit} фото. Нажми "${session.mode === 'catalog' ? 'Найти товар' : 'Готово'}" или "Очистить".`,
+      session.mode === 'catalog' ? catalogKeyboard() : productKeyboard()
     );
     return;
   }
@@ -781,21 +910,34 @@ bot.on('photo', async (ctx) => {
   const photo = ctx.message.photo[ctx.message.photo.length - 1];
   session.photos.push(photo.file_id);
 
+  if (session.mode === 'catalog') {
+    await ctx.reply(
+      `Фото штрихкода добавлено (${session.photos.length}/${currentLimit}). Когда закончишь, нажми "Найти товар".`,
+      catalogKeyboard()
+    );
+    return;
+  }
+
   if (session.barcodeRetryMode) {
     await ctx.reply(
       `Дополнительное фото добавлено (${session.photos.length}/${currentLimit}). Когда закончишь, нажми "Готово".`,
-      keyboard()
+      productKeyboard()
     );
   } else {
     await ctx.reply(
       `Фото добавлено (${session.photos.length}/${currentLimit}). Когда закончишь, нажми "Готово".`,
-      keyboard()
+      productKeyboard()
     );
   }
 });
 
-bot.hears('Готово', async (ctx) => {
+bot.hears('Найти товар', async (ctx) => {
   const session = getSession(ctx.chat.id);
+
+  if (session.mode !== 'catalog') {
+    await ctx.reply('Сначала выбери раздел "Каталог товаров".', mainMenuKeyboard());
+    return;
+  }
 
   if (session.processing) {
     await ctx.reply('Подожди, я уже обрабатываю фото.');
@@ -803,7 +945,65 @@ bot.hears('Готово', async (ctx) => {
   }
 
   if (!session.photos.length) {
-    await ctx.reply('Сначала загрузи хотя бы одну фотографию товара.', keyboard());
+    await ctx.reply('Сначала загрузи хотя бы одно фото штрихкода.', catalogKeyboard());
+    return;
+  }
+
+  session.processing = true;
+
+  try {
+    await ctx.reply('Ищу товар по штрихкоду...');
+
+    const imageDataUrls = [];
+    for (const fileId of session.photos) {
+      const meta = await getTelegramFileMeta(fileId);
+      imageDataUrls.push(bufferToDataUrl(meta.buffer, meta.mimeType));
+    }
+
+    const barcode = await extractBarcodeFromImages(imageDataUrls);
+
+    if (!barcode || !isValidEan13(barcode)) {
+      session.processing = false;
+      await ctx.reply(getBarcodeRetryMessage(), catalogKeyboard());
+      return;
+    }
+
+    const found = await findRowByBarcode(barcode);
+
+    session.processing = false;
+    session.photos = [];
+
+    if (!found) {
+      await ctx.reply(`Товар со штрихкодом ${barcode} в таблице не найден.`, catalogKeyboard());
+      return;
+    }
+
+    await ctx.reply(`Штрихкод: ${barcode}\n\n${formatCatalogResponse(found.row)}`, catalogKeyboard());
+  } catch (e) {
+    console.error('=== CATALOG ERROR START ===');
+    console.error(e);
+    console.error('=== CATALOG ERROR END ===');
+
+    session.processing = false;
+    await ctx.reply('Ошибка поиска товара. Попробуй ещё раз или нажми "Очистить".', catalogKeyboard());
+  }
+});
+
+bot.hears('Готово', async (ctx) => {
+  const session = getSession(ctx.chat.id);
+
+  if (session.mode !== 'add') {
+    await ctx.reply('Сначала выбери раздел "Добавить новый товар в таблицу".', mainMenuKeyboard());
+    return;
+  }
+
+  if (session.processing) {
+    await ctx.reply('Подожди, я уже обрабатываю фото.');
+    return;
+  }
+
+  if (!session.photos.length) {
+    await ctx.reply('Сначала загрузи хотя бы одну фотографию товара.', productKeyboard());
     return;
   }
 
@@ -838,7 +1038,7 @@ bot.hears('Готово', async (ctx) => {
       session.processing = false;
       session.barcodeRetryMode = true;
 
-      await ctx.reply(getBarcodeRetryMessage(), keyboard());
+      await ctx.reply(getBarcodeRetryMessage(), productKeyboard());
       return;
     }
 
@@ -861,7 +1061,7 @@ bot.hears('Готово', async (ctx) => {
         session.processing = false;
         await ctx.reply(
           `Не хватает данных для заполнения столбца - ${fields[key]}. Пришли дополнительные фото и снова нажми "Готово".`,
-          keyboard()
+          productKeyboard()
         );
         return;
       }
@@ -885,8 +1085,9 @@ bot.hears('Готово', async (ctx) => {
 
     await writeToGoogleSheets(result, photoUrl);
 
-    resetSession(ctx.chat.id);
+    resetSession(ctx.chat.id, 'main');
     await ctx.reply('✅ Товар записан в таблицу', tableButton());
+    await ctx.reply('Главное меню:', mainMenuKeyboard());
   } catch (e) {
     console.error('=== BOT ERROR START ===');
     console.error(e);
@@ -895,14 +1096,27 @@ bot.hears('Готово', async (ctx) => {
     session.processing = false;
     await ctx.reply(
       'Ошибка обработки. Попробуй ещё раз или нажми "Очистить".',
-      keyboard()
+      productKeyboard()
     );
   }
 });
 
 bot.on('message', async (ctx) => {
   if (ctx.message.photo) return;
-  await ctx.reply('Подгрузи фотографии товара', keyboard());
+
+  const session = getSession(ctx.chat.id);
+
+  if (session.mode === 'add') {
+    await ctx.reply('Подгрузи фотографии товара или вернись в главное меню.', productKeyboard());
+    return;
+  }
+
+  if (session.mode === 'catalog') {
+    await ctx.reply('Пришли фото штрихкода товара или вернись в главное меню.', catalogKeyboard());
+    return;
+  }
+
+  await ctx.reply('Главное меню:', mainMenuKeyboard());
 });
 
 bot.launch();
