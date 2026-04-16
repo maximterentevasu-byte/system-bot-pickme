@@ -1090,9 +1090,8 @@ bot.hears('Готово', async (ctx) => {
 
     await writeToGoogleSheets(result, photoUrl);
 
-    resetSession(ctx.chat.id, 'main');
-    await ctx.reply('✅ Товар записан в таблицу', tableButton());
-    await ctx.reply('Главное меню:', mainMenuKeyboard());
+    resetSession(ctx.chat.id, 'add');
+    await ctx.reply('✅ Товар записан в таблицу', productKeyboard());
   } catch (e) {
     console.error('=== BOT ERROR START ===');
     console.error(e);
