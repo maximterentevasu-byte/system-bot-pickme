@@ -13,6 +13,8 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+const OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
+
 // ===== GOOGLE =====
 
 const auth = new google.auth.GoogleAuth({
@@ -39,7 +41,7 @@ const DRIVE_FOLDER_ID = process.env.DRIVE_FOLDER_ID || '';
 const sessions = new Map();
 const cache = new Map();
 
-const INITIAL_MAX_PHOTOS = 3;
+const INITIAL_MAX_PHOTOS = 5;
 const RETRY_MAX_PHOTOS = 10;
 
 function keyboard() {
@@ -147,56 +149,144 @@ function barcodeMatches(sheetBarcode, targetBarcode) {
   return false;
 }
 
-async function generateExtraFields(data) {
+function normalizeText(value, fallback = 'не указано') {
+  const text = String(value || '').trim();
+  return text || fallback;
+}
+
+function normalizeShu(value, rangeFallback = '0-500') {
+  const raw = String(value || '').replace(/[^\d]/g, '');
+  if (!raw) return 'не указано';
+  return raw;
+}
+
+function normalizePh(value, fallback = 'не указано') {
+  const text = String(value || '')
+    .replace(',', '.')
+    .replace(/[^\d.]/g, '')
+    .trim();
+
+  if (!text) return fallback;
+
+  const num = Number(text);
+  if (!Number.isFinite(num)) return fallback;
+
+  return num.toFixed(1);
+}
+
+function classifySpicinessByShu(shu) {
+  const num = Number(shu);
+  if (!Number.isFinite(num)) {
+    return { label: 'Не острое', range: '0-500' };
+  }
+
+  if (num <= 500) return { label: 'Не острое', range: '0-500' };
+  if (num <= 2500) return { label: 'Слабо острое', range: '501-2500' };
+  if (num <= 15000) return { label: 'Средне острое', range: '2501-15000' };
+  if (num <= 50000) return { label: 'Острое', range: '15001-50000' };
+  return { label: 'Очень острое', range: '50001+' };
+}
+
+function classifyAcidityByPh(ph) {
+  const num = Number(ph);
+  if (!Number.isFinite(num)) {
+    return { label: 'Слабо кислое', range: '4.1-5.0' };
+  }
+
+  if (num <= 3.0) return { label: 'Очень кислое', range: '0-3.0' };
+  if (num <= 4.0) return { label: 'Кислое', range: '3.1-4.0' };
+  if (num <= 5.0) return { label: 'Средне кислое', range: '4.1-5.0' };
+  if (num <= 6.0) return { label: 'Слабо кислое', range: '5.1-6.0' };
+  return { label: 'Не кислое', range: '6.1-7.0' };
+}
+
+function sanitizeSpiceAcidResult(result) {
+  const rawShu = normalizeShu(result?.spiciness?.estimated_shu);
+  const rawPh = normalizePh(result?.acidity?.estimated_ph);
+
+  const spicinessAuto = classifySpicinessByShu(rawShu);
+  const acidityAuto = classifyAcidityByPh(rawPh);
+
+  return {
+    product_type: normalizeText(result?.product_type),
+    spiciness: {
+      level_label: spicinessAuto.label,
+      estimated_shu: rawShu,
+      shu_range: spicinessAuto.range,
+    },
+    acidity: {
+      level_label: acidityAuto.label,
+      estimated_ph: rawPh,
+      ph_range: acidityAuto.range,
+    },
+    confidence: normalizeText(result?.confidence, 'средняя'),
+    warnings: normalizeText(result?.warnings, 'нет'),
+    reasoning: normalizeText(result?.reasoning),
+  };
+}
+
+function formatSpiceAcidFields(result) {
+  return {
+    spice: [
+      `Категория: ${result.spiciness.level_label}`,
+      `Scoville (SHU): ${result.spiciness.estimated_shu}`,
+      `Шкала: ${result.spiciness.shu_range}`,
+    ].join('\n'),
+    acid: [
+      `Категория: ${result.acidity.level_label}`,
+      `pH: ${result.acidity.estimated_ph}`,
+      `Шкала: ${result.acidity.ph_range}`,
+    ].join('\n'),
+  };
+}
+
+async function analyzeSpiceAcid(data) {
   const response = await openai.responses.create({
-    model: 'gpt-4.1-mini',
+    model: OPENAI_MODEL,
     input: [{
       role: 'user',
       content: [{
         type: 'input_text',
-        text: `Ты анализируешь продукт для карточки товара.
-Верни только JSON без markdown и пояснений.
-Все поля только на русском языке.
-Не оставляй пустые поля: если точных данных нет, аккуратно укажи "не указано".
+        text: `Ты эксперт по анализу пищевых товаров.
+Определи только оценочную остроту и кислотность товара по уже извлечённым данным о товаре.
+Не анализируй фото напрямую, опирайся на название, описание, состав, детали, производителя и тип продукта.
+Это нужно, чтобы результат для одного и того же товара был максимально стабильным.
 
-Нужно вернуть JSON строго такого формата:
-{
-  "spice": "Категория: ...\nScoville (SHU): ...\nШкала: ...",
-  "acid": "Категория: ...\npH: ...\nШкала: ...",
-  "k": "Вкусовые характеристики товара / описание вкуса / описание визуала / кому понравится товар / всё важное для принятия решения о покупке.",
-  "l": "Как приготовить / как употреблять (готов к употреблению или нужно готовить) / самостоятельное блюдо или нет / с чем сочетается.",
-  "m": "Самый популярный рецепт приготовления / ссылка на рецепт на русском языке, если есть, иначе напиши: Ссылка: не указано"
-}
+Правила:
+- Ответ только JSON, без markdown и пояснений.
+- Не выдумывай экстремальные значения без явных признаков.
+- Если точных данных нет, дай осторожную оценку по типу продукта, вкусу и ингредиентам.
+- estimated_shu укажи числом без единиц либо "не указано".
+- estimated_ph укажи числом с точкой либо "не указано".
+- reasoning коротко, 1-2 предложения.
 
-Правила для остроты (5 категорий):
-1. Не острое
-2. Слабо острое
-3. Средне острое
-4. Острое
-5. Очень острое
-
-Правила для кислотности (5 категорий):
-1. Не кислое
-2. Слабо кислое
-3. Средне кислое
-4. Кислое
-5. Очень кислое
-
-Если точные SHU или pH не указаны, оцени по типу продукта, вкусу и описанию, но честно пиши "не указано" в строке SHU или pH, а категорию и шкалу всё равно определи максимально разумно.
-
-Шкалы остроты:
+Шкала остроты:
 - Не острое: 0-500
 - Слабо острое: 501-2500
 - Средне острое: 2501-15000
 - Острое: 15001-50000
 - Очень острое: 50001+
 
-Шкалы кислотности:
+Шкала кислотности:
 - Не кислое: 6.1-7.0
 - Слабо кислое: 5.1-6.0
 - Средне кислое: 4.1-5.0
 - Кислое: 3.1-4.0
 - Очень кислое: 0-3.0
+
+Верни JSON:
+{
+  "product_type": "",
+  "spiciness": {
+    "estimated_shu": ""
+  },
+  "acidity": {
+    "estimated_ph": ""
+  },
+  "confidence": "высокая | средняя | низкая",
+  "warnings": "",
+  "reasoning": ""
+}
 
 Данные о товаре:
 Название: ${data.name || 'не указано'}
@@ -209,12 +299,56 @@ async function generateExtraFields(data) {
   });
 
   const parsed = parseModelJson(response.output_text);
+  return sanitizeSpiceAcidResult(parsed);
+}
+
+async function generateExtraFields(data) {
+  const [spiceAcid, contentResponse] = await Promise.all([
+    analyzeSpiceAcid(data),
+    openai.responses.create({
+      model: OPENAI_MODEL,
+      input: [{
+        role: 'user',
+        content: [{
+          type: 'input_text',
+          text: `Ты анализируешь продукт для карточки товара.
+Верни только JSON без markdown и пояснений.
+Все поля только на русском языке.
+Не оставляй пустые поля: если точных данных нет, аккуратно укажи "не указано".
+
+Нужно вернуть JSON строго такого формата:
+{
+  "k": "Вкусовые характеристики товара / описание вкуса / описание визуала / кому понравится товар / всё важное для принятия решения о покупке.",
+  "l": "Как приготовить / как употреблять (готов к употреблению или нужно готовить) / самостоятельное блюдо или нет / с чем сочетается.",
+  "m": "Самый популярный рецепт приготовления / ссылка на рецепт на русском языке, если есть, иначе напиши: Ссылка: не указано"
+}
+
+Требования:
+- Поле k: укажи вкус, текстуру, визуал, кому понравится товар и что важно знать перед покупкой.
+- Поле l: укажи как употреблять, нужно ли готовить, можно ли есть как самостоятельный продукт и с чем сочетается.
+- Поле m: укажи самый популярный способ приготовления или подачи и отдельной строкой ссылку в формате: Ссылка: ...
+- Если ссылка неизвестна, пиши: Ссылка: не указано
+
+Данные о товаре:
+Название: ${data.name || 'не указано'}
+Описание: ${data.description || 'не указано'}
+Детали: ${data.details || 'не указано'}
+Производитель: ${data.manufacturer || 'не указано'}
+Штрихкод: ${data.barcode || 'не указано'}`
+        }]
+      }]
+    })
+  ]);
+
+  const contentParsed = parseModelJson(contentResponse.output_text);
+  const spiceFields = formatSpiceAcidFields(spiceAcid);
+
   return {
-    spice: String(parsed?.spice || '').trim(),
-    acid: String(parsed?.acid || '').trim(),
-    k: String(parsed?.k || '').trim(),
-    l: String(parsed?.l || '').trim(),
-    m: String(parsed?.m || '').trim(),
+    spice: spiceFields.spice,
+    acid: spiceFields.acid,
+    k: String(contentParsed?.k || '').trim(),
+    l: String(contentParsed?.l || '').trim(),
+    m: String(contentParsed?.m || '').trim(),
   };
 }
 
@@ -426,6 +560,7 @@ async function writeToGoogleSheets(data, photoUrl) {
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
     range: 'RUSIFIK!A:M',
+    valueRenderOption: 'FORMATTED_VALUE',
   });
 
   const rows = res.data.values || [];
@@ -445,8 +580,9 @@ async function writeToGoogleSheets(data, photoUrl) {
   if (rowIndex === -1) {
     await sheets.spreadsheets.values.append({
       spreadsheetId: SPREADSHEET_ID,
-      range: SHEET_RANGE,
+      range: 'RUSIFIK!A:H',
       valueInputOption: 'USER_ENTERED',
+      insertDataOption: 'INSERT_ROWS',
       requestBody: {
         values: [[
           data.name || '',
@@ -457,52 +593,81 @@ async function writeToGoogleSheets(data, photoUrl) {
           photoCellValue,
           extra.spice || '',
           extra.acid || '',
-          '',
-          '',
-          extra.k || '',
-          extra.l || '',
-          extra.m || '',
         ]],
       },
     });
+
+    const afterAppend = await sheets.spreadsheets.values.get({
+      spreadsheetId: SPREADSHEET_ID,
+      range: 'RUSIFIK!A:M',
+      valueRenderOption: 'FORMATTED_VALUE',
+    });
+    const afterRows = afterAppend.data.values || [];
+    let newRowIndex = -1;
+    for (let i = afterRows.length - 1; i >= 1; i--) {
+      if (barcodeMatches(afterRows[i][4], barcode)) {
+        newRowIndex = i;
+        break;
+      }
+    }
+
+    if (newRowIndex !== -1) {
+      await sheets.spreadsheets.values.update({
+        spreadsheetId: SPREADSHEET_ID,
+        range: `RUSIFIK!K${newRowIndex + 1}:M${newRowIndex + 1}`,
+        valueInputOption: 'USER_ENTERED',
+        requestBody: {
+          values: [[extra.k || '', extra.l || '', extra.m || '']],
+        },
+      });
+    }
     return;
   }
 
   const row = rows[rowIndex] || [];
-  const updated = Array.from({ length: 13 }, (_, index) => row[index] || '');
+  const sectionAH = Array.from({ length: 8 }, (_, index) => row[index] || '');
+  const sectionKM = [row[10] || '', row[11] || '', row[12] || ''];
 
   function isEmptyCell(value) {
     return value === undefined || value === null || String(value).trim() === '';
   }
 
-  function setIfEmpty(index, value) {
-    if (!isEmptyCell(value) && isEmptyCell(updated[index])) {
-      updated[index] = value;
+  function setIfEmpty(target, index, value) {
+    if (!isEmptyCell(value) && isEmptyCell(target[index])) {
+      target[index] = value;
     }
   }
 
-  setIfEmpty(0, data.name || '');
-  setIfEmpty(1, data.description || '');
-  setIfEmpty(2, data.details || '');
-  setIfEmpty(3, data.manufacturer || '');
-  setIfEmpty(4, `'${barcode}`);
-  setIfEmpty(5, photoCellValue);
-  setIfEmpty(6, extra.spice || '');
-  setIfEmpty(7, extra.acid || '');
-  setIfEmpty(10, extra.k || '');
-  setIfEmpty(11, extra.l || '');
-  setIfEmpty(12, extra.m || '');
+  setIfEmpty(sectionAH, 0, data.name || '');
+  setIfEmpty(sectionAH, 1, data.description || '');
+  setIfEmpty(sectionAH, 2, data.details || '');
+  setIfEmpty(sectionAH, 3, data.manufacturer || '');
+  setIfEmpty(sectionAH, 4, `'${barcode}`);
+  setIfEmpty(sectionAH, 5, photoCellValue);
+  setIfEmpty(sectionAH, 6, extra.spice || '');
+  setIfEmpty(sectionAH, 7, extra.acid || '');
+  setIfEmpty(sectionKM, 0, extra.k || '');
+  setIfEmpty(sectionKM, 1, extra.l || '');
+  setIfEmpty(sectionKM, 2, extra.m || '');
 
   await sheets.spreadsheets.values.update({
     spreadsheetId: SPREADSHEET_ID,
-    range: `RUSIFIK!A${rowIndex + 1}:M${rowIndex + 1}`,
+    range: `RUSIFIK!A${rowIndex + 1}:H${rowIndex + 1}`,
     valueInputOption: 'USER_ENTERED',
     requestBody: {
-      values: [updated],
+      values: [sectionAH],
+    },
+  });
+
+  await sheets.spreadsheets.values.update({
+    spreadsheetId: SPREADSHEET_ID,
+    range: `RUSIFIK!K${rowIndex + 1}:M${rowIndex + 1}`,
+    valueInputOption: 'USER_ENTERED',
+    requestBody: {
+      values: [sectionKM],
     },
   });
 }
-
 
 
 // ===== BOT =====
