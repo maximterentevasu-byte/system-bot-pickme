@@ -149,6 +149,80 @@ function barcodeMatches(sheetBarcode, targetBarcode) {
   return false;
 }
 
+function columnToLetter(columnNumber) {
+  let result = '';
+  let n = Number(columnNumber);
+  while (n > 0) {
+    const remainder = (n - 1) % 26;
+    result = String.fromCharCode(65 + remainder) + result;
+    n = Math.floor((n - 1) / 26);
+  }
+  return result;
+}
+
+function makeSingleCellUpdate(rowNumber, columnNumber, value) {
+  return {
+    range: `RUSIFIK!${columnToLetter(columnNumber)}${rowNumber}`,
+    values: [[value]],
+  };
+}
+
+let rusifikSheetIdCache = null;
+
+async function getRusifikSheetId() {
+  if (rusifikSheetIdCache !== null) return rusifikSheetIdCache;
+
+  const meta = await sheets.spreadsheets.get({
+    spreadsheetId: SPREADSHEET_ID,
+  });
+
+  const targetSheet = (meta.data.sheets || []).find((sheet) => {
+    return sheet.properties && sheet.properties.title === 'RUSIFIK';
+  });
+
+  if (!targetSheet || !targetSheet.properties || targetSheet.properties.sheetId === undefined) {
+    throw new Error('Не найден лист RUSIFIK в Google Sheets');
+  }
+
+  rusifikSheetIdCache = targetSheet.properties.sheetId;
+  return rusifikSheetIdCache;
+}
+
+async function copyIJFromPreviousRow(targetRowNumber) {
+  if (targetRowNumber <= 2) return;
+
+  const sheetId = await getRusifikSheetId();
+
+  await sheets.spreadsheets.batchUpdate({
+    spreadsheetId: SPREADSHEET_ID,
+    requestBody: {
+      requests: [
+        {
+          copyPaste: {
+            source: {
+              sheetId,
+              startRowIndex: targetRowNumber - 2,
+              endRowIndex: targetRowNumber - 1,
+              startColumnIndex: 8,
+              endColumnIndex: 10,
+            },
+            destination: {
+              sheetId,
+              startRowIndex: targetRowNumber - 1,
+              endRowIndex: targetRowNumber,
+              startColumnIndex: 8,
+              endColumnIndex: 10,
+            },
+            pasteType: 'PASTE_NORMAL',
+            pasteOrientation: 'NORMAL',
+          },
+        },
+      ],
+    },
+  });
+}
+
+
 function normalizeText(value, fallback = 'не указано') {
   const text = String(value || '').trim();
   return text || fallback;
@@ -577,10 +651,14 @@ async function writeToGoogleSheets(data, photoUrl) {
 
   const extra = await generateExtraFields(data);
 
+  function isEmptyCell(value) {
+    return value === undefined || value === null || String(value).trim() === '';
+  }
+
   if (rowIndex === -1) {
     await sheets.spreadsheets.values.append({
       spreadsheetId: SPREADSHEET_ID,
-      range: 'RUSIFIK!A:H',
+      range: 'RUSIFIK!A:M',
       valueInputOption: 'USER_ENTERED',
       insertDataOption: 'INSERT_ROWS',
       requestBody: {
@@ -593,6 +671,11 @@ async function writeToGoogleSheets(data, photoUrl) {
           photoCellValue,
           extra.spice || '',
           extra.acid || '',
+          '',
+          '',
+          extra.k || '',
+          extra.l || '',
+          extra.m || '',
         ]],
       },
     });
@@ -612,61 +695,49 @@ async function writeToGoogleSheets(data, photoUrl) {
     }
 
     if (newRowIndex !== -1) {
-      await sheets.spreadsheets.values.update({
-        spreadsheetId: SPREADSHEET_ID,
-        range: `RUSIFIK!K${newRowIndex + 1}:M${newRowIndex + 1}`,
-        valueInputOption: 'USER_ENTERED',
-        requestBody: {
-          values: [[extra.k || '', extra.l || '', extra.m || '']],
-        },
-      });
+      const newRowNumber = newRowIndex + 1;
+      const previousRow = afterRows[newRowIndex - 1] || [];
+      const currentRow = afterRows[newRowIndex] || [];
+      const shouldCopyIJ = newRowIndex > 1 && (!isEmptyCell(previousRow[8]) || !isEmptyCell(previousRow[9]));
+
+      if (shouldCopyIJ && isEmptyCell(currentRow[8]) && isEmptyCell(currentRow[9])) {
+        await copyIJFromPreviousRow(newRowNumber);
+      }
     }
     return;
   }
 
   const row = rows[rowIndex] || [];
-  const sectionAH = Array.from({ length: 8 }, (_, index) => row[index] || '');
-  const sectionKM = [row[10] || '', row[11] || '', row[12] || ''];
+  const rowNumber = rowIndex + 1;
+  const cellUpdates = [];
 
-  function isEmptyCell(value) {
-    return value === undefined || value === null || String(value).trim() === '';
-  }
-
-  function setIfEmpty(target, index, value) {
-    if (!isEmptyCell(value) && isEmptyCell(target[index])) {
-      target[index] = value;
+  function queueIfEmpty(columnNumber, currentValue, nextValue) {
+    if (!isEmptyCell(nextValue) && isEmptyCell(currentValue)) {
+      cellUpdates.push(makeSingleCellUpdate(rowNumber, columnNumber, nextValue));
     }
   }
 
-  setIfEmpty(sectionAH, 0, data.name || '');
-  setIfEmpty(sectionAH, 1, data.description || '');
-  setIfEmpty(sectionAH, 2, data.details || '');
-  setIfEmpty(sectionAH, 3, data.manufacturer || '');
-  setIfEmpty(sectionAH, 4, `'${barcode}`);
-  setIfEmpty(sectionAH, 5, photoCellValue);
-  setIfEmpty(sectionAH, 6, extra.spice || '');
-  setIfEmpty(sectionAH, 7, extra.acid || '');
-  setIfEmpty(sectionKM, 0, extra.k || '');
-  setIfEmpty(sectionKM, 1, extra.l || '');
-  setIfEmpty(sectionKM, 2, extra.m || '');
+  queueIfEmpty(1, row[0], data.name || '');
+  queueIfEmpty(2, row[1], data.description || '');
+  queueIfEmpty(3, row[2], data.details || '');
+  queueIfEmpty(4, row[3], data.manufacturer || '');
+  queueIfEmpty(5, row[4], `'${barcode}`);
+  queueIfEmpty(6, row[5], photoCellValue);
+  queueIfEmpty(7, row[6], extra.spice || '');
+  queueIfEmpty(8, row[7], extra.acid || '');
+  queueIfEmpty(11, row[10], extra.k || '');
+  queueIfEmpty(12, row[11], extra.l || '');
+  queueIfEmpty(13, row[12], extra.m || '');
 
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `RUSIFIK!A${rowIndex + 1}:H${rowIndex + 1}`,
-    valueInputOption: 'USER_ENTERED',
-    requestBody: {
-      values: [sectionAH],
-    },
-  });
-
-  await sheets.spreadsheets.values.update({
-    spreadsheetId: SPREADSHEET_ID,
-    range: `RUSIFIK!K${rowIndex + 1}:M${rowIndex + 1}`,
-    valueInputOption: 'USER_ENTERED',
-    requestBody: {
-      values: [sectionKM],
-    },
-  });
+  if (cellUpdates.length > 0) {
+    await sheets.spreadsheets.values.batchUpdate({
+      spreadsheetId: SPREADSHEET_ID,
+      requestBody: {
+        valueInputOption: 'USER_ENTERED',
+        data: cellUpdates,
+      },
+    });
+  }
 }
 
 
