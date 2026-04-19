@@ -781,6 +781,7 @@ async function uploadPhotoToDrive(buffer, mimeType, fileName) {
 
 async function writeToGoogleSheets(data, photoUrl) {
   const photoCellValue = photoUrl ? `=IMAGE("${photoUrl}")` : '';
+  const barcodeCellValue = data.barcode ? `="${normalizeBarcode(data.barcode)}"` : '';
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
@@ -818,7 +819,7 @@ async function writeToGoogleSheets(data, photoUrl) {
           data.description || '',
           data.details || '',
           data.manufacturer || '',
-          `'${barcode}`,
+          barcodeCellValue,
           photoCellValue,
           extra.spice || '',
           extra.acid || '',
@@ -872,7 +873,7 @@ async function writeToGoogleSheets(data, photoUrl) {
   queueIfEmpty(2, row[1], data.description || '');
   queueIfEmpty(3, row[2], data.details || '');
   queueIfEmpty(4, row[3], data.manufacturer || '');
-  queueIfEmpty(5, row[4], `'${barcode}`);
+  queueIfEmpty(5, row[4], barcodeCellValue);
   queueIfEmpty(6, row[5], photoCellValue);
   queueIfEmpty(7, row[6], extra.spice || '');
   queueIfEmpty(8, row[7], extra.acid || '');
