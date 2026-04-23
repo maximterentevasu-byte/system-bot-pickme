@@ -781,7 +781,7 @@ async function uploadPhotoToDrive(buffer, mimeType, fileName) {
 
 async function writeToGoogleSheets(data, photoUrl) {
   const photoCellValue = photoUrl ? `=IMAGE("${photoUrl}")` : '';
-  const barcodeCellValue = data.barcode ? `="${normalizeBarcode(data.barcode)}"` : '';
+  const barcodeCellValue = data.barcode ? normalizeBarcode(data.barcode) : '';
 
   const res = await sheets.spreadsheets.values.get({
     spreadsheetId: SPREADSHEET_ID,
